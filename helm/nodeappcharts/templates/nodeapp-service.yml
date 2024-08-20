@@ -29,7 +29,7 @@ metadata:
   name: node-app-service
 spec:
   ports:
-  - port: 80
+  - port: 30200
     targetPort: node-app-port
     protocol: TCP
   selector:
