@@ -1,0 +1,148 @@
+pipeline {
+    agent any
+
+    environment {
+        JAVA_HOME = '/usr/lib/jvm/java-1.17.0-openjdk-arm64'
+        SONAR_SCANNER_HOME = '/opt/sonar-scanner/bin'  // Adjust this path to where SonarScanner is installed
+        PATH = "${SONAR_SCANNER_HOME}:${env.PATH}"
+        SONARQUBE_URL = 'http://172.20.4.244/:9000'
+        DOCKER_CREDENTIALS_ID = 'test' // Jenkins credential ID for Docker Hub login
+        IMAGE_NAME = 'devopskevlar/node-app'
+        KUBERNETES_CREDENTIALS = 'my_kubernetes'
+    }
+
+    stages {
+        stage('Check Java Version') {
+            steps {
+                sh 'java -version'
+                sh 'npm -version'
+                sh 'node --version'
+            }
+        }
+
+        stage('Fetch Code') {
+            steps {
+
+                git branch: 'main', url: 'https://github.com/kevlar2/lil-node-test-app.git'
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                script {
+                    // sh 'cd node-app'
+                    echo 'Installing dependencies...'
+                    sh 'npm install'
+                }
+            }
+        }
+
+        stage('Test') {
+            steps {
+                script {
+                    // sh 'cd node-app'
+                    echo 'Running tests...'
+                    // sh 'npm test'
+                }
+            }
+        }
+        // run sonarqube test
+        stage('Run Sonarqube') {
+            environment {
+                scannerHome = tool 'lil-sonar-tool';
+            }
+            steps {
+              withSonarQubeEnv(credentialsId: 'mysonarcreds', installationName: 'lil sonar installation') {
+                sh '''${scannerHome}/bin/sonar-scanner \
+                -Dsonar.projectName=lil_node_test_app \
+                -Dsonar.sources=. \
+                -Dsonar.inclusions=**/*.html -X'''
+                // sh 'sonar-scanner -Dsonar.host.url=$SONARQUBE_URL'
+              }
+
+              // Adding a timeout block to wait for the SonarQube quality gate results
+                timeout(time: 10, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                script {
+                    echo 'Building Docker image...'
+                    sh 'docker build -t ${IMAGE_NAME}:V${BUILD_NUMBER} .'
+                    echo 'Build completed successfully'
+                }
+            }
+        }
+
+        stage('Docker Push') {
+            steps {
+                script {
+                    docker.withRegistry('', DOCKER_CREDENTIALS_ID) {
+                        sh "docker login"
+                        sh "docker push ${IMAGE_NAME}:V${BUILD_NUMBER}"
+                        echo 'Build image pushed successfully'
+
+                    }
+                }
+            }
+        }
+
+        stage('Deploy app on K8s') {
+            steps {
+                script {
+                    // Assuming KUBERNETES_CREDENTIALS is used to authenticate with the Kubernetes cluster
+                    withCredentials([file(credentialsId: 'my_kubernetes', variable: 'KUBECONFIG')]) {
+                        sh "helm upgrade --install --force node-app-deployment helm/nodeappcharts --set appimage=${IMAGE_NAME}:V${BUILD_NUMBER} --namespace node-app-prod"
+                        sh "kubectl get pods -n node-app-prod --show-labels -o wide"
+                        sh "helm list -all"
+                    }
+                }
+            }
+        }
+    }
+
+
+    post {
+        always {
+            echo 'Cleaning up...'
+            script {
+                echo 'Removing unused Docker images...'
+
+                sh '''
+                current_image_name=$(docker images --filter=reference="${IMAGE_NAME}:V${BUILD_NUMBER}" --format "{{.Repository}}")
+                if [ -n "$current_image_name" ]; then
+                    images_to_remove=$(docker images --format "{{.Repository}}:{{.Tag}} {{.ID}}" | grep "^$current_image_name:" | grep -v ":V${BUILD_NUMBER}" | awk '{print $2}')
+
+                    for image_id in $images_to_remove; do
+                        # Check if the image is being used by any running container
+                        while docker ps -a --filter ancestor=$image_id --format '{{.ID}}' | grep -q .; do
+                            echo "Image $image_id is in use by a running container. Waiting..."
+                            sleep 10
+                        done
+
+                        # Remove the image after it is no longer in use
+                        echo "Removing image $image_id"
+                        docker rmi -f $image_id
+                    done
+                else
+                    echo "No images found for the current build name."
+                fi
+                '''
+                echo 'Unused Docker images removed successfully'
+            }
+        }
+        success {
+            echo 'Pipeline completed successfully!'
+            script {
+                echo 'Logging out of Docker...'
+                sh 'docker logout'
+            }
+        }
+        failure {
+            echo 'Pipeline failed!'
+        }
+    }
+}
